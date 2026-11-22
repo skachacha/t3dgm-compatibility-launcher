@@ -1,0 +1,18 @@
+# Build outputs and local runtime files
+*.exe
+*.dll
+*.o
+*.obj
+*.pdb
+*.ilk
+*.log
+*.t3dgm-writing
+*.t3dgm-restoring
+/build*/
+/old/
+/logs/
+
+# Preview records and review notes; not build inputs
+/source/build-record.json
+/source/SHA256SUMS.txt
+/source/BUILDING.md

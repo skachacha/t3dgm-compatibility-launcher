@@ -1,0 +1,4 @@
+# Preserve upstream archives and licence files byte for byte.
+LICENSES/** -text -whitespace
+/LICENSE -text -whitespace
+source/vendor/** -text -whitespace
