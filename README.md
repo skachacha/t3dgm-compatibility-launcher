@@ -11,6 +11,8 @@ Utility to apply a runtime patch to **The 3D Gamemaker** and install **DDrawComp
 </p>
 
 ## Usage
+> [!IMPORTANT]  
+> Make sure you don't have any compatibility settings set for any executables. Disable *"Run this program in compatibility mode for:"* and *"Run this program as an administrator"* or the launcher won't work.
 ### The 3D Gamemaker
 Copy `T3DGM-Compatibility.exe` into your installation of The 3D Gamemaker and run it. It makes no permanent changes to the actual `t3dgm.exe` and therefore **must** be used to launch The 3D Gamemaker. Use it instead of the **LAUNCH** button inside Steam.
 
