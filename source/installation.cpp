@@ -4,38 +4,41 @@
 #include <algorithm>
 #include <array>
 #include <fstream>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 
 namespace {
 using Bytes = std::vector<unsigned char>;
 constexpr char Configuration[] = "FullscreenMode = borderless\r\nDisplayResolution = desktop\r\nResolutionScale = app(1)\r\n";
-constexpr std::array<const wchar_t*, 3> Originals{L"DDraw.dll", L"D3DImm.dll", L"setup.ini"};
+constexpr wchar_t LedgerName[] = L"compatibility-state.txt";
+constexpr std::array<const wchar_t*, 3> SharedNames{L"DDraw.dll", L"D3DImm.dll", L"setup.ini"};
 
 void plain(const fs::path& path, bool directory = false) {
     DWORD attributes = GetFileAttributesW(path.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES || bool(attributes & FILE_ATTRIBUTE_DIRECTORY) != directory ||
-        (attributes & FILE_ATTRIBUTE_REPARSE_POINT))
-        throw std::runtime_error("Expected a plain " + std::string(directory ? "directory: " : "file: ") + utf8(path.wstring()));
+    need(attributes != INVALID_FILE_ATTRIBUTES && bool(attributes & FILE_ATTRIBUTE_DIRECTORY) == directory &&
+         !(attributes & FILE_ATTRIBUTE_REPARSE_POINT), "Expected a plain installation file or directory");
 }
-
 std::wstring state(const fs::path& path) {
-    if (!fs::exists(path) && !fs::is_symlink(fs::symlink_status(path))) return {};
-    plain(path);
-    return file_hash(path);
+    DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        DWORD error = GetLastError();
+        win32_need(error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND, "Cannot inspect installation file");
+        return {};
+    }
+    plain(path); return file_hash(path);
 }
-
-Bytes read_bytes(const fs::path& path) {
+Bytes read_bytes(const fs::path& path, std::uintmax_t limit = 64 * 1024 * 1024) {
     plain(path);
     auto length = fs::file_size(path);
-    if (length > 1048576) throw std::runtime_error("Configuration file is too large");
+    need(length <= limit, "Managed file exceeds the installation size limit");
     std::ifstream input(path, std::ios::binary);
     Bytes bytes(static_cast<std::size_t>(length));
     input.read(reinterpret_cast<char*>(bytes.data()), std::streamsize(bytes.size()));
-    if (!input || input.gcount() != std::streamsize(bytes.size())) throw std::runtime_error("Cannot read configuration file");
+    need(bool(input) && input.gcount() == std::streamsize(bytes.size()), "Cannot read installation file");
     return bytes;
 }
-
 std::wstring bytes_hash(const Bytes& bytes) {
     HCRYPTPROV provider = 0;
     HCRYPTHASH hash = 0;
@@ -43,31 +46,24 @@ std::wstring bytes_hash(const Bytes& bytes) {
     try {
         win32_need(CryptCreateHash(provider, CALG_SHA_256, 0, 0, &hash), "Cannot create hash");
         win32_need(CryptHashData(hash, bytes.data(), DWORD(bytes.size()), 0), "Cannot hash payload");
-        std::array<BYTE, 32> digest{};
-        DWORD length = DWORD(digest.size());
+        std::array<BYTE, 32> digest{}; DWORD length = DWORD(digest.size());
         win32_need(CryptGetHashParam(hash, HP_HASHVAL, digest.data(), &length, 0), "Cannot read payload hash");
         std::wstring result;
         for (auto byte : digest) { result += L"0123456789abcdef"[byte >> 4]; result += L"0123456789abcdef"[byte & 15]; }
-        CryptDestroyHash(hash); CryptReleaseContext(provider, 0);
-        return result;
+        CryptDestroyHash(hash); CryptReleaseContext(provider, 0); return result;
     } catch (...) {
         if (hash) CryptDestroyHash(hash);
-        CryptReleaseContext(provider, 0);
-        throw;
+        CryptReleaseContext(provider, 0); throw;
     }
 }
-
 Bytes config_bytes() { return Bytes(Configuration, Configuration + sizeof(Configuration) - 1); }
-
 std::wstring lower(std::wstring value) {
-    for (auto& character : value) if (character >= L'A' && character <= L'Z') character += L'a' - L'A';
+    for (auto& c : value) if (c >= L'A' && c <= L'Z') c += L'a' - L'A';
     return value;
 }
-
 std::wstring trim(const std::wstring& value) {
     auto first = value.find_first_not_of(L" \t\r\n");
-    if (first == std::wstring::npos) return {};
-    return value.substr(first, value.find_last_not_of(L" \t\r\n") - first + 1);
+    return first == std::wstring::npos ? L"" : value.substr(first, value.find_last_not_of(L" \t\r\n") - first + 1);
 }
 
 Bytes fullscreen_ini(const Bytes& bytes) {
@@ -80,51 +76,73 @@ Bytes fullscreen_ini(const Bytes& bytes) {
     if (encoding == Utf8) {
         std::string value(bytes.begin() + prefix, bytes.end());
         int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), int(value.size()), nullptr, 0);
-        if (!count && !value.empty()) throw std::runtime_error("Invalid UTF-8 setup.ini");
+        need(count || value.empty(), "Invalid UTF-8 setup.ini");
         text.resize(count);
         MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), int(value.size()), text.data(), count);
     } else if (encoding == SingleByte) {
         for (auto byte : bytes) text += wchar_t(byte);
     } else {
-        if ((bytes.size() - prefix) % 2) throw std::runtime_error("Invalid UTF-16 setup.ini");
+        need((bytes.size() - prefix) % 2 == 0, "Invalid UTF-16 setup.ini");
         for (auto at = prefix; at < bytes.size(); at += 2)
             text += wchar_t(encoding == Utf16LE ? bytes[at] | (bytes[at + 1] << 8) : (bytes[at] << 8) | bytes[at + 1]);
     }
-    std::wstring section, result;
-    unsigned settings = 0, startup = 0;
+    need(text.find(L'\0') == std::wstring::npos, "NUL character in setup.ini");
+    const std::wstring newline = text.find(L"\r\n") != std::wstring::npos ? L"\r\n" :
+        text.find(L'\n') != std::wstring::npos ? L"\n" : L"\r\n";
+    std::vector<std::wstring> lines;
     for (std::size_t at = 0; at < text.size();) {
-        auto end = text.find(L'\n', at);
-        end = end == std::wstring::npos ? text.size() : end + 1;
-        auto line = text.substr(at, end - at);
-        auto stripped = trim(line);
+        auto end = text.find(L'\n', at); end = end == std::wstring::npos ? text.size() : end + 1;
+        lines.push_back(text.substr(at, end - at)); at = end;
+    }
+    // Check precedence before changing any lines.
+    std::array<int, 2> sections{-1, -1}, keys{-1, -1};
+    std::wstring section;
+    for (std::size_t at = 0; at < lines.size(); ++at) {
+        auto stripped = trim(lines[at]);
         if (!stripped.empty() && stripped.front() == L'[') {
             auto close = stripped.find(L']');
-            if (close != std::wstring::npos) section = lower(trim(stripped.substr(1, close - 1)));
-        }
-        auto equals = line.find(L'=');
-        if (equals != std::wstring::npos) {
-            auto key = lower(trim(line.substr(0, equals)));
-            if ((section == L"settings" && key == L"windowmode") || (section == L"startup" && key == L"window")) {
-                if (section == L"settings") ++settings; else ++startup;
-                auto begin = line.find_first_not_of(L" \t", equals + 1);
-                if (begin == std::wstring::npos) begin = line.size();
-                auto finish = line.find_first_of(L";\r\n", begin);
-                if (finish == std::wstring::npos) finish = line.size();
-                while (finish > begin && (line[finish - 1] == L' ' || line[finish - 1] == L'\t')) --finish;
-                line.replace(begin, finish - begin, L"0");
+            if (close != std::wstring::npos) {
+                section = lower(trim(stripped.substr(1, close - 1)));
+                int slot = section == L"settings" ? 0 : section == L"startup" ? 1 : -1;
+                if (slot >= 0) { need(sections[slot] == -1, "Duplicate fullscreen section in setup.ini"); sections[slot] = int(at); }
             }
         }
-        result += line;
-        at = end;
+        auto equals = lines[at].find(L'=');
+        if (equals == std::wstring::npos) continue;
+        auto key = lower(trim(lines[at].substr(0, equals)));
+        int slot = section == L"settings" && key == L"windowmode" ? 0 : section == L"startup" && key == L"window" ? 1 : -1;
+        if (slot >= 0) { need(keys[slot] == -1, "Duplicate fullscreen key in setup.ini"); keys[slot] = int(at); }
     }
-    if (settings != 1 || startup != 1) throw std::runtime_error("Expected exactly one SETTINGS/windowmode and one STARTUP/window key in setup.ini");
+    for (int slot = 0; slot != 2; ++slot) if (keys[slot] >= 0) {
+        auto& line = lines[keys[slot]]; auto begin = line.find(L'=') + 1;
+        while (begin < line.size() && (line[begin] == L' ' || line[begin] == L'\t')) ++begin;
+        auto end = line.find_first_of(L";\r\n", begin);
+        if (end == std::wstring::npos) end = line.size();
+        while (end > begin && (line[end - 1] == L' ' || line[end - 1] == L'\t')) --end;
+        line.replace(begin, end - begin, L"0");
+    }
+    std::wstring result;
+    auto append = [&](const std::wstring& line) {
+        if (!result.empty() && result.back() != L'\n') result += newline;
+        result += line;
+    };
+    for (std::size_t at = 0; at < lines.size(); ++at) {
+        result += lines[at];
+        for (int slot = 0; slot != 2; ++slot)
+            if (sections[slot] == int(at) && keys[slot] == -1)
+                append((slot == 0 ? L"windowmode=0" : L"window=0") + newline);
+    }
+    for (int slot = 0; slot != 2; ++slot) if (sections[slot] == -1) {
+        append((slot == 0 ? L"[SETTINGS]" : L"[STARTUP]") + newline);
+        append((slot == 0 ? L"windowmode=0" : L"window=0") + newline);
+    }
     Bytes output(bytes.begin(), bytes.begin() + prefix);
     if (encoding == Utf8) {
         auto encoded = utf8(result); output.insert(output.end(), encoded.begin(), encoded.end());
-    } else for (auto character : result) {
-        if (encoding == SingleByte) output.push_back(static_cast<unsigned char>(character));
-        else if (encoding == Utf16LE) { output.push_back(character & 255); output.push_back(character >> 8); }
-        else { output.push_back(character >> 8); output.push_back(character & 255); }
+    } else for (auto c : result) {
+        if (encoding == SingleByte) output.push_back(static_cast<unsigned char>(c));
+        else if (encoding == Utf16LE) { output.push_back(c & 255); output.push_back(c >> 8); }
+        else { output.push_back(c >> 8); output.push_back(c & 255); }
     }
     return output;
 }
@@ -143,11 +161,13 @@ void atomic_write(const fs::path& path, const Bytes& bytes) {
         win32_need(MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH), "Cannot replace installation file");
     } catch (...) {
         if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
-        DeleteFileW(temporary.c_str());
-        throw;
+        DeleteFileW(temporary.c_str()); throw;
     }
 }
-
+void remove_plain(const fs::path& path) {
+    if (state(path).empty()) return;
+    win32_need(DeleteFileW(path.c_str()), "Cannot remove managed installation file");
+}
 Bytes wrapper_payload() {
     auto resource = FindResourceW(nullptr, MAKEINTRESOURCEW(101), RT_RCDATA);
     win32_need(resource != nullptr, "Embedded DDrawCompat resource is missing");
@@ -155,121 +175,219 @@ Bytes wrapper_payload() {
     need(size == 3653632, "Embedded DDrawCompat resource size differs");
     auto loaded = LoadResource(nullptr, resource);
     auto pointer = static_cast<const BYTE*>(LockResource(loaded));
-    win32_need(pointer != nullptr, "Cannot read embedded DDrawCompat resource");
+    win32_need(pointer != nullptr, "Cannot read embedded DDrawCompat");
     Bytes bytes(pointer, pointer + size);
-    if (bytes_hash(bytes) != WrapperSha256) throw std::runtime_error("Embedded DDrawCompat SHA256 differs");
+    need(bytes_hash(bytes) == WrapperSha256, "Embedded DDrawCompat SHA256 differs");
     return bytes;
 }
 
-bool backup_complete(const fs::path& root) {
-    auto old = root / L"old";
-    if (!fs::exists(old)) return false;
-    plain(old, true);
-    if (state(old / L"DDraw.dll") != OriginalDDrawSha256 || state(old / L"D3DImm.dll") != OriginalD3DImmSha256 ||
-        !fs::exists(old / L"setup.ini")) return false;
-    fullscreen_ini(read_bytes(old / L"setup.ini"));
-    return true;
+struct Record { std::wstring name, original, installed; };
+using Records = std::vector<Record>;
+bool valid_hash(const std::wstring& value) {
+    return value.empty() || (value.size() == 64 && value.find_first_not_of(L"0123456789abcdef") == std::wstring::npos);
 }
-
-void no_running_editor(const fs::path& root) {
+bool config_name(const std::wstring& name) {
+    return name.size() > 16 && lower(name).substr(0, 12) == L"ddrawcompat-" && lower(name).substr(name.size() - 4) == L".ini";
+}
+void validate_records(const Records& records) {
+    need(records.size() >= 4 && records.size() <= 515, "Invalid backup ledger size");
+    for (std::size_t at = 0; at < records.size(); ++at) {
+        const auto& r = records[at];
+        need(!r.name.empty() && r.name.find_first_of(L"\\/:*?\"<>|\t\r\n") == std::wstring::npos &&
+             r.name.back() != L'.' && r.name.back() != L' ' &&
+             (at < 3 ? r.name == SharedNames[at] : config_name(r.name)), "Invalid backup ledger filename");
+        need(valid_hash(r.original) && valid_hash(r.installed), "Invalid backup ledger hash");
+        for (std::size_t before = 0; before < at; ++before)
+            need(_wcsicmp(records[before].name.c_str(), r.name.c_str()) != 0, "Duplicate backup ledger filename");
+    }
+    need(records[0].installed == WrapperSha256 && records[1].installed.empty() && !records[2].installed.empty(),
+         "Unexpected installation hashes in backup ledger");
+    for (std::size_t at = 3; at < records.size(); ++at)
+        need(records[at].installed == bytes_hash(config_bytes()), "Unexpected configuration hash in backup ledger");
+}
+Bytes ledger_bytes(const Records& records) {
+    validate_records(records);
+    std::wstring text = L"T3DGM Compatibility backup 1\r\n";
+    for (const auto& r : records)
+        text += L"F\t" + r.name + L"\t" + (r.original.empty() ? L"-" : r.original) + L"\t" +
+                (r.installed.empty() ? L"-" : r.installed) + L"\r\n";
+    auto bytes = utf8(text); return Bytes(bytes.begin(), bytes.end());
+}
+Records load_records(const fs::path& root) {
+    auto old = root / L"old";
+    if (!fs::exists(old)) return {};
+    plain(old, true);
+    Records records;
+    if (fs::exists(old / LedgerName)) {
+        auto bytes = read_bytes(old / LedgerName, 1024 * 1024);
+        std::string encoded(bytes.begin(), bytes.end());
+        auto text = widen(encoded);
+        need(utf8(text) == encoded, "Invalid UTF-8 backup ledger");
+        std::wistringstream input(text); std::wstring line;
+        need(bool(std::getline(input, line)) && line == L"T3DGM Compatibility backup 1\r", "Unsupported backup ledger");
+        while (std::getline(input, line)) {
+            if (!line.empty() && line.back() == L'\r') line.pop_back();
+            auto a = line.find(L'\t'), b = line.find(L'\t', a + 1), c = line.find(L'\t', b + 1);
+            need(a == 1 && line[0] == L'F' && b != std::wstring::npos && c != std::wstring::npos &&
+                 line.find(L'\t', c + 1) == std::wstring::npos, "Invalid backup ledger row");
+            auto original = line.substr(b + 1, c - b - 1), installed = line.substr(c + 1);
+            records.push_back({line.substr(a + 1, b - a - 1), original == L"-" ? L"" : original, installed == L"-" ? L"" : installed});
+        }
+    } else {
+        if (fs::is_empty(old)) return {};
+        // Version 0.1.0 kept exactly these three original Steam files.
+        for (const auto& item : fs::directory_iterator(old)) {
+            bool known = false;
+            for (auto name : SharedNames) known |= _wcsicmp(item.path().filename().c_str(), name) == 0;
+            need(known, "The old folder contains an unrecognised backup; keep it and move it aside first");
+        }
+        need(state(old / SharedNames[0]) == OriginalDDrawSha256 &&
+             state(old / SharedNames[1]) == OriginalD3DImmSha256 && !state(old / SharedNames[2]).empty(),
+             "No complete verified 0.1.0 backup in old");
+        auto ini = fullscreen_ini(read_bytes(old / SharedNames[2], 1024 * 1024));
+        records = {{SharedNames[0], OriginalDDrawSha256, WrapperSha256},
+                   {SharedNames[1], OriginalD3DImmSha256, L""},
+                   {SharedNames[2], state(old / SharedNames[2]), bytes_hash(ini)},
+                   {L"DDrawCompat-t3dgm.ini", L"", bytes_hash(config_bytes())}};
+    }
+    validate_records(records);
+    for (const auto& r : records)
+        need(state(old / r.name) == r.original, "An original backup is missing or changed; nothing has been restored");
+    return records;
+}
+void verify_current(const fs::path& root, const Records& records) {
+    for (const auto& r : records) {
+        auto current = state(root / r.name);
+        need(current.empty() || current == r.original || current == r.installed,
+             "A managed file changed after installation; keep it and restore it manually before continuing");
+    }
+}
+void no_running_application(const fs::path& root) {
+    std::vector<std::wstring> names;
+    for (const auto& item : fs::directory_iterator(root))
+        if (_wcsicmp(item.path().extension().c_str(), L".exe") == 0) names.push_back(item.path().filename().wstring());
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    win32_need(snapshot != INVALID_HANDLE_VALUE, "Cannot check for a running editor");
+    win32_need(snapshot != INVALID_HANDLE_VALUE, "Cannot check for a running application");
     PROCESSENTRY32W entry{}; entry.dwSize = sizeof entry;
     bool running = false;
     if (Process32FirstW(snapshot, &entry)) do {
-        if (_wcsicmp(entry.szExeFile, L"t3dgm.exe")) continue;
+        if (entry.th32ProcessID == GetCurrentProcessId()) continue;
+        if (std::none_of(names.begin(), names.end(), [&](const auto& n) { return _wcsicmp(n.c_str(), entry.szExeFile) == 0; })) continue;
         HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
         std::array<wchar_t, 32768> name{}; DWORD count = DWORD(name.size());
         if (!process || !QueryFullProcessImageNameW(process, 0, name.data(), &count)) running = true;
-        else running = _wcsicmp(name.data(), (root / L"t3dgm.exe").c_str()) == 0;
+        else running = _wcsicmp(fs::path(name.data()).parent_path().c_str(), root.c_str()) == 0;
         if (process) CloseHandle(process);
         if (running) break;
     } while (Process32NextW(snapshot, &entry));
     CloseHandle(snapshot);
-    if (running) throw std::runtime_error("Close T3DGM before installing or restoring");
+    need(!running, "Close applications in the selected game folder before installing or restoring");
+}
+using Snapshot = std::vector<std::pair<fs::path, std::optional<Bytes>>>;
+Snapshot snapshot_files(const fs::path& root, const Records& records) {
+    Snapshot result;
+    for (const auto& r : records) {
+        auto path = root / r.name;
+        result.push_back({path, state(path).empty() ? std::optional<Bytes>{} : read_bytes(path)});
+    }
+    return result;
+}
+void put(const fs::path& path, const std::optional<Bytes>& bytes) {
+    if (bytes) {
+        if (state(path) != bytes_hash(*bytes)) atomic_write(path, *bytes);
+    } else remove_plain(path);
+}
+void rollback(const Snapshot& snapshot) {
+    for (const auto& [path, bytes] : snapshot) put(path, bytes);
+}
+void save_baseline(const fs::path& root, const Records& records) {
+    auto old = root / L"old";
+    if (!CreateDirectoryW(old.c_str(), nullptr))
+        win32_need(GetLastError() == ERROR_ALREADY_EXISTS, "Cannot create old backup folder");
+    plain(old, true);
+    for (const auto& r : records) {
+        if (r.original.empty()) { need(state(old / r.name).empty(), "Unexpected original backup file"); continue; }
+        if (state(old / r.name).empty()) {
+            auto bytes = read_bytes(root / r.name);
+            need(bytes_hash(bytes) == r.original, "Original file changed while preparing backup");
+            atomic_write(old / r.name, bytes);
+        }
+        need(state(old / r.name) == r.original, "Original backup differs");
+    }
+    // Record absence and installed hashes before replacing anything.
+    atomic_write(old / LedgerName, ledger_bytes(records));
+}
 }
 
-void remove_plain(const fs::path& path) {
-    if (!fs::exists(path)) return;
-    plain(path);
-    win32_need(DeleteFileW(path.c_str()), "Cannot remove managed installation file");
+fs::path graphics_config(const Target& target) {
+    return target.folder() / (L"DDrawCompat-" + target.executable.stem().wstring() + L".ini");
 }
-}
-
-void validate_target(const fs::path& root) {
-    verify_file(root / L"t3dgm.exe", TargetSha256);
-    verify_file(root / L"d3drm.dll", RetainedModeSha256);
-}
-
 Graphics graphics_state(const fs::path& root) {
     auto ddraw = state(root / L"DDraw.dll"), immediate = state(root / L"D3DImm.dll");
+    if (ddraw.empty() && immediate.empty()) return Graphics::System;
     if (ddraw == OriginalDDrawSha256 && immediate == OriginalD3DImmSha256) return Graphics::Original;
+    if (ddraw == DevtestDDrawSha256 && immediate == DevtestD3DImmSha256) return Graphics::Devtest;
     if (ddraw == WrapperSha256 && immediate.empty()) return Graphics::DDrawCompat;
-    return Graphics::Unknown;
+    return Graphics::Other;
 }
-
 bool restore_available(const fs::path& root) {
-    if (!backup_complete(root)) return false;
-    for (auto name : Originals) if (state(root / name) != state(root / L"old" / name)) return true;
-    return fs::exists(root / L"DDrawCompat-t3dgm.ini");
+    auto records = load_records(root);
+    return std::any_of(records.begin(), records.end(), [&](const auto& r) { return state(root / r.name) != r.original; });
 }
-
-void restore_originals(const fs::path& root) {
-    validate_target(root); no_running_editor(root);
-    if (!backup_complete(root)) throw std::runtime_error("No complete verified backup was found in old");
-    auto old = root / L"old";
-    auto original_ini = read_bytes(old / L"setup.ini");
-    std::array<std::wstring, 3> original{OriginalDDrawSha256, OriginalD3DImmSha256, bytes_hash(original_ini)};
-    std::array<std::wstring, 3> installed{WrapperSha256, L"", bytes_hash(fullscreen_ini(original_ini))};
-    for (std::size_t at = 0; at < Originals.size(); ++at) {
-        auto current = state(root / Originals[at]);
-        if (!current.empty() && current != original[at] && current != installed[at])
-            throw std::runtime_error("A managed file changed after installation: " + utf8(Originals[at]));
-    }
-    auto config = state(root / L"DDrawCompat-t3dgm.ini");
-    if (!config.empty() && config != bytes_hash(config_bytes())) throw std::runtime_error("DDrawCompat-t3dgm.ini changed after installation");
-    for (std::size_t at = 0; at < Originals.size(); ++at) {
-        auto destination = root / Originals[at];
-        if (at == 2) atomic_write(destination, original_ini);
-        else {
-            auto staging = fs::path(destination.wstring() + L".t3dgm-restoring");
-            win32_need(CopyFileW((old / Originals[at]).c_str(), staging.c_str(), TRUE), "Cannot stage original DLL");
-            try {
-                verify_file(staging, original[at].c_str());
-                win32_need(MoveFileExW(staging.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH), "Cannot restore original DLL");
-            } catch (...) { DeleteFileW(staging.c_str()); throw; }
-        }
-        verify_file(destination, original[at].c_str());
-    }
-    remove_plain(root / L"DDrawCompat-t3dgm.ini");
+bool installed_for(const Target& target) {
+    auto records = load_records(target.folder());
+    auto name = graphics_config(target).filename().wstring();
+    return !records.empty() && graphics_state(target.folder()) == Graphics::DDrawCompat &&
+        state(target.folder() / SharedNames[2]) == records[2].installed &&
+        std::any_of(records.begin() + 3, records.end(), [&](const auto& r) {
+            return _wcsicmp(r.name.c_str(), name.c_str()) == 0 && state(target.folder() / r.name) == r.installed;
+        });
 }
-
-void install_ddrawcompat(const fs::path& root) {
-    validate_target(root); no_running_editor(root);
-    if (graphics_state(root) != Graphics::Original) throw std::runtime_error("Original Steam DLLs are required before installation, reinstall or verify file integrity in steam");
-    for (auto name : {L"DDrawCompat.ini", L"DDrawCompat-t3dgm.ini", L"DDrawCompatOverlay-t3dgm.ini", L"wndmode.dll", L"T3DGM-Compatibility-state.json", L"T3DGM-startup-active.json"})
-        if (fs::exists(root / name)) throw std::runtime_error("Keep the existing file and restore/move it aside first: " + utf8(name));
-    auto original_ini = read_bytes(root / L"setup.ini");
-    auto installed_ini = fullscreen_ini(original_ini);
+void install_ddrawcompat(const Target& target) {
+    validate_dependency(target);
+    const auto root = target.folder();
+    no_running_application(root);
+    auto records = load_records(root);
+    if (!records.empty()) verify_current(root, records);
+    if (records.empty()) {
+        for (auto name : SharedNames) records.push_back({name, state(root / name), L""});
+        records[0].installed = WrapperSha256;
+        records[2].installed = bytes_hash(fullscreen_ini(records[2].original.empty() ? Bytes{} : read_bytes(root / SharedNames[2], 1024 * 1024)));
+    }
+    auto name = graphics_config(target).filename().wstring();
+    if (std::none_of(records.begin(), records.end(), [&](const auto& r) { return _wcsicmp(r.name.c_str(), name.c_str()) == 0; }))
+        records.push_back({name, state(root / name), bytes_hash(config_bytes())});
+    validate_records(records);
     auto wrapper = wrapper_payload();
-    auto old = root / L"old";
-    if (!CreateDirectoryW(old.c_str(), nullptr)) win32_need(GetLastError() == ERROR_ALREADY_EXISTS, "Cannot create old backup folder");
-    plain(old, true);
-    for (auto name : Originals) {
-        auto destination = old / name;
-        auto expected = file_hash(root / name);
-        if (!fs::exists(destination)) win32_need(CopyFileW((root / name).c_str(), destination.c_str(), TRUE), "Cannot copy original file to old");
-        verify_file(destination, expected.c_str());
-    }
+    Bytes ini = fullscreen_ini(records[2].original.empty() ? Bytes{} :
+        fs::exists(root / L"old" / SharedNames[2]) ? read_bytes(root / L"old" / SharedNames[2], 1024 * 1024) : read_bytes(root / SharedNames[2], 1024 * 1024));
+    need(bytes_hash(ini) == records[2].installed, "Fullscreen configuration does not match the backup ledger");
+    auto snapshot = snapshot_files(root, records);
+    save_baseline(root, records);
     try {
-        atomic_write(root / L"DDraw.dll", wrapper);
-        remove_plain(root / L"D3DImm.dll");
-        atomic_write(root / L"setup.ini", installed_ini);
-        atomic_write(root / L"DDrawCompat-t3dgm.ini", config_bytes());
-        verify_file(root / L"DDraw.dll", WrapperSha256);
+        put(root / SharedNames[0], wrapper);
+        put(root / SharedNames[1], std::nullopt);
+        put(root / SharedNames[2], ini);
+        put(root / name, config_bytes());
     } catch (...) {
-        // Keep originals in old even if an interrupted operation needs recovery
-        try { restore_originals(root); } catch (...) {}
+        try { rollback(snapshot); }
+        catch (...) { throw std::runtime_error("Installation failed and rollback was incomplete; keep old for restoration"); }
+        throw;
+    }
+}
+void restore_originals(const Target& target) {
+    const auto root = target.folder();
+    no_running_application(root);
+    auto records = load_records(root);
+    need(!records.empty(), "No verified original backup was found in old");
+    verify_current(root, records);
+    auto snapshot = snapshot_files(root, records);
+    try {
+        for (const auto& r : records)
+            put(root / r.name, r.original.empty() ? std::optional<Bytes>{} : read_bytes(root / L"old" / r.name));
+    } catch (...) {
+        try { rollback(snapshot); }
+        catch (...) { throw std::runtime_error("Restoration failed and rollback was incomplete; originals remain in old"); }
         throw;
     }
 }

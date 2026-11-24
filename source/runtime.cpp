@@ -59,20 +59,24 @@ void write_text(HANDLE file, const std::wstring& text) {
     need(count == bytes.size(), "Cannot write text");
 }
 
-std::wstring digest(HANDLE file) {
+std::wstring hash_range(HANDLE file, std::uint64_t offset, std::uint64_t size) {
     HCRYPTPROV provider = 0;
     HCRYPTHASH hash = 0;
     win32_need(CryptAcquireContextW(&provider, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT), "Cannot open SHA256 provider");
     try {
         win32_need(CryptCreateHash(provider, CALG_SHA_256, 0, 0, &hash), "Cannot create SHA256 hash");
-        LARGE_INTEGER zero{};
-        win32_need(SetFilePointerEx(file, zero, nullptr, FILE_BEGIN), "Cannot rewind file");
+        LARGE_INTEGER position{};
+        position.QuadPart = static_cast<LONGLONG>(offset);
+        win32_need(SetFilePointerEx(file, position, nullptr, FILE_BEGIN), "Cannot seek file");
         std::array<BYTE, 32768> buffer{};
         DWORD count = 0;
-        do {
-            win32_need(ReadFile(file, buffer.data(), DWORD(buffer.size()), &count, nullptr), "Cannot read file");
-            if (count) win32_need(CryptHashData(hash, buffer.data(), count, 0), "Cannot hash file");
-        } while (count);
+        while (size) {
+            DWORD requested = DWORD(std::min<std::uint64_t>(size, buffer.size()));
+            win32_need(ReadFile(file, buffer.data(), requested, &count, nullptr), "Cannot read file");
+            need(count == requested, "File ended inside hash range");
+            win32_need(CryptHashData(hash, buffer.data(), count, 0), "Cannot hash file");
+            size -= count;
+        }
         std::array<BYTE, 32> bytes{};
         count = DWORD(bytes.size());
         win32_need(CryptGetHashParam(hash, HP_HASHVAL, bytes.data(), &count, 0), "Cannot finish SHA256");
@@ -89,6 +93,13 @@ std::wstring digest(HANDLE file) {
         CryptReleaseContext(provider, 0);
         throw;
     }
+}
+
+std::wstring digest(HANDLE file) {
+    LARGE_INTEGER size{};
+    win32_need(GetFileSizeEx(file, &size), "Cannot measure file");
+    need(size.QuadPart >= 0, "Invalid file size");
+    return hash_range(file, 0, static_cast<std::uint64_t>(size.QuadPart));
 }
 
 Handle* open_file(const fs::path& path) {
@@ -113,12 +124,6 @@ fs::path module_folder() {
     win32_need(count != 0, "Cannot locate launcher");
     need(count < name.size(), "Cannot locate launcher");
     return fs::path(std::wstring(name.data(), count)).parent_path();
-}
-
-fs::path game_folder(const fs::path& here) {
-    if (fs::is_regular_file(here / L"t3dgm.exe")) return here;
-    if (fs::is_regular_file(here.parent_path() / L"t3dgm.exe")) return here.parent_path();
-    throw std::runtime_error("Put this entire compatibility folder inside the Steam game folder, beside t3dgm.exe");
 }
 
 std::string legacy_path(const fs::path& path) {
@@ -205,7 +210,7 @@ class Log {
 public:
     explicit Log(const fs::path& path) : file_(CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
         nullptr, OPEN_ALWAYS, FILE_FLAG_OPEN_REPARSE_POINT, nullptr)) {
-        win32_need(file_.valid(), "Cannot open last-launch.txt in the compatibility folder");
+        win32_need(file_.valid(), "Cannot open launcher log");
         BY_HANDLE_FILE_INFORMATION info{};
         win32_need(GetFileInformationByHandle(file_.get(), &info), "Log is not a plain file");
         need(!(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)), "Log is not a plain file");
@@ -235,8 +240,8 @@ void code_byte(HANDLE process, std::uintptr_t address, BYTE value) {
     win32_need(FlushInstructionCache(process, reinterpret_cast<void*>(address), 1), "Cannot flush startup instruction");
 }
 
-void redirect(HANDLE process, const std::string& root) {
-    auto address = PreferredBase + TempBufferRva;
+void redirect(HANDLE process, const Target& target, const std::string& root) {
+    auto address = PreferredBase + target.profile->temporary_rva;
     MEMORY_BASIC_INFORMATION memory{};
     SIZE_T inspected = VirtualQueryEx(process, reinterpret_cast<void*>(address), &memory, sizeof memory);
     win32_need(inspected != 0, "Temporary pathname buffer is not writable");
@@ -246,11 +251,18 @@ void redirect(HANDLE process, const std::string& root) {
     std::array<char, 256> old{};
     read_remote(process, address, old.data(), old.size());
     need(std::find(old.begin(), old.end(), '\0') != old.end(), "Temporary pathname is not bounded");
-    std::array<char, 256> windows{};
-    UINT count = GetWindowsDirectoryA(windows.data(), UINT(windows.size()));
-    win32_need(count != 0, "Cannot identify Windows directory");
-    need(count < windows.size(), "Cannot identify Windows directory");
-    std::string expected = std::string(windows.data()) + "\\Temp";
+    std::string expected;
+    if (target.profile->temporary_root == TemporaryRoot::WindowsTemp) {
+        std::array<char, 256> windows{};
+        UINT count = GetWindowsDirectoryA(windows.data(), UINT(windows.size()));
+        win32_need(count != 0, "Cannot identify Windows directory");
+        need(count < windows.size(), "Cannot identify Windows directory");
+        expected = std::string(windows.data()) + "\\Temp";
+    } else {
+        auto drive = target.executable.root_name().wstring();
+        need(drive.size() == 2 && drive[1] == L':', "Vista runtime requires a drive-letter executable path");
+        expected = utf8(drive) + "\\dbTemp";
+    }
     need(_stricmp(old.data(), expected.c_str()) == 0, "Original temporary pathname differs from the verified startup state");
     write_remote(process, address, root.c_str(), root.size() + 1);
     std::vector<char> checked(root.size() + 1);
@@ -258,17 +270,19 @@ void redirect(HANDLE process, const std::string& root) {
     need(std::string(checked.data(), checked.size()) == root + '\0', "Temporary pathname readback differs");
 }
 
-DWORD run(const fs::path& executable, const fs::path& working, const std::string& temporary, Log& log, bool& cleanup_safe, void (*on_detached)()) {
+DWORD run(const Target& target, const std::string& temporary, Log& log, bool& cleanup_safe, void (*on_detached)()) {
     STARTUPINFOW startup{};
     startup.cb = sizeof startup;
     PROCESS_INFORMATION info{};
-    std::wstring command = L"\"" + executable.wstring() + L"\"";
-    win32_need(CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
-                       DEBUG_ONLY_THIS_PROCESS, nullptr, working.c_str(), &startup, &info), "Cannot start t3dgm.exe");
+    std::wstring command = L"\"" + target.executable.wstring() + L"\"";
+    win32_need(CreateProcessW(target.executable.c_str(), command.data(), nullptr, nullptr, FALSE,
+                       DEBUG_ONLY_THIS_PROCESS, nullptr, target.folder().c_str(), &startup, &info), "Cannot start selected executable");
     cleanup_safe = false;
     HANDLE own_process = nullptr;
     if (!DuplicateHandle(GetCurrentProcess(), info.hProcess, GetCurrentProcess(), &own_process, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
         TerminateProcess(info.hProcess, 1);
+        if (WaitForSingleObject(info.hProcess, 5000) == WAIT_OBJECT_0) cleanup_safe = true;
+        CloseHandle(info.hThread); CloseHandle(info.hProcess);
         throw std::runtime_error("Cannot retain application process handle");
     }
     Handle process(own_process);
@@ -286,7 +300,7 @@ DWORD run(const fs::path& executable, const fs::path& working, const std::string
     };
     bool detached = false, event_pending = false, exited = false, loader_break = false;
     DEBUG_EVENT event{};
-    const auto checkpoint = PreferredBase + CheckpointRva;
+    const auto checkpoint = PreferredBase + target.profile->checkpoint_rva;
     const auto started = GetTickCount64();
     try {
         win32_need(DebugSetProcessKillOnExit(TRUE), "Cannot set startup failure handling");
@@ -306,9 +320,9 @@ DWORD run(const fs::path& executable, const fs::path& working, const std::string
                 remember(created.hProcess);
                 if (reinterpret_cast<std::uintptr_t>(created.lpBaseOfImage) != PreferredBase)
                     throw std::runtime_error("Unexpected executable image base: " + std::to_string(reinterpret_cast<std::uintptr_t>(created.lpBaseOfImage)));
-                std::array<BYTE, CheckpointBytes.size()> bytes{};
+                std::vector<BYTE> bytes(target.profile->signature_size);
                 read_remote(process.get(), checkpoint, bytes.data(), bytes.size());
-                need(bytes == CheckpointBytes, "Startup instruction signature differs");
+                need(std::equal(bytes.begin(), bytes.end(), target.profile->signature.begin()), "Startup instruction signature differs");
                 code_byte(process.get(), checkpoint, 0xcc);
             } else if (event.dwDebugEventCode == CREATE_THREAD_DEBUG_EVENT) {
                 remember(event.u.CreateThread.hThread);
@@ -328,8 +342,8 @@ DWORD run(const fs::path& executable, const fs::path& working, const std::string
                     context.ContextFlags = CONTEXT_CONTROL;
                     win32_need(GetThreadContext(thread.get(), &context), "Unexpected startup instruction pointer");
                     need(context.Eip == checkpoint + 1, "Unexpected startup instruction pointer");
-                    redirect(process.get(), temporary);
-                    code_byte(process.get(), checkpoint, CheckpointBytes[0]);
+                    redirect(process.get(), target, temporary);
+                    code_byte(process.get(), checkpoint, target.profile->signature[0]);
                     context.Eip = DWORD(checkpoint);
                     win32_need(SetThreadContext(thread.get(), &context), "Cannot restore startup instruction pointer");
                     win32_need(SuspendThread(thread.get()) != DWORD(-1), "Cannot hold startup thread for detachment");
@@ -391,15 +405,15 @@ std::wstring file_hash(const fs::path& path) {
     return digest(file->get());
 }
 
-int launch_game(const fs::path& root, const fs::path& log_folder, void (*on_detached)()) {
-    std::unique_ptr<Handle> executable(open_file(root / L"t3dgm.exe"));
-    need(digest(executable->get()) == TargetSha256, "Unsupported t3dgm.exe version");
-    verify_file(root / L"d3drm.dll", RetainedModeSha256);
-    Log log(log_folder / L"last-launch.txt");
-    log.line(L"T3DGM Compatibility 0.1.0");
+int launch_game(const Target& target, const fs::path& log_file, void (*on_detached)()) {
+    validate_dependency(target);
+    Log log(log_file);
+    log.line(L"T3DGM Compatibility 0.2.0");
+    log.line(L"Executable: " + target.executable.wstring());
+    log.line(L"Native runtime: " + std::wstring(target.profile->name));
     Scratch scratch;
     auto temporary = legacy_path(scratch.path());
     log.line(L"Temporary files on disk: " + scratch.path().wstring());
-    DWORD code = run(root / L"t3dgm.exe", root, temporary, log, scratch.cleanup_safe(), on_detached);
+    DWORD code = run(target, temporary, log, scratch.cleanup_safe(), on_detached);
     return code == 0 ? 0 : 1;
 }

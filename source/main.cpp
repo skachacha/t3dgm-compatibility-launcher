@@ -71,20 +71,36 @@ void close_launcher_console() noexcept {
 
 class ActionLock {
     HANDLE mutex_ = nullptr;
+    HANDLE directory_ = INVALID_HANDLE_VALUE;
 public:
     explicit ActionLock(const fs::path& root) {
-        std::uint64_t value = 14695981039346656037ull;
-        for (wchar_t character : root.wstring()) { value ^= std::towlower(character); value *= 1099511628211ull; }
-        auto name = L"Local\\T3DGM-Compatibility-" + std::to_wstring(value);
+        directory_ = CreateFileW(root.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        win32_need(directory_ != INVALID_HANDLE_VALUE, "Cannot hold selected game folder");
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!GetFileInformationByHandle(directory_, &info) || !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+            (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            CloseHandle(directory_); directory_ = INVALID_HANDLE_VALUE;
+            throw std::runtime_error("Selected game folder is not a plain directory");
+        }
+        auto name = L"Local\\T3DGM-Compatibility-" + std::to_wstring(info.dwVolumeSerialNumber) + L"-" +
+            std::to_wstring(info.nFileIndexHigh) + L"-" + std::to_wstring(info.nFileIndexLow);
         mutex_ = CreateMutexW(nullptr, FALSE, name.c_str());
-        win32_need(mutex_ != nullptr, "Cannot open launcher operation lock");
+        if (!mutex_) {
+            DWORD error = GetLastError(); CloseHandle(directory_); directory_ = INVALID_HANDLE_VALUE; SetLastError(error);
+            win32_need(false, "Cannot open launcher operation lock");
+        }
         DWORD result = WaitForSingleObject(mutex_, 0);
         if (result != WAIT_OBJECT_0 && result != WAIT_ABANDONED) {
             CloseHandle(mutex_); mutex_ = nullptr;
+            CloseHandle(directory_); directory_ = INVALID_HANDLE_VALUE;
             throw std::runtime_error("Another launcher action is running for this installation");
         }
     }
-    ~ActionLock() { if (mutex_) { ReleaseMutex(mutex_); CloseHandle(mutex_); } }
+    ~ActionLock() {
+        if (mutex_) { ReleaseMutex(mutex_); CloseHandle(mutex_); }
+        if (directory_ != INVALID_HANDLE_VALUE) CloseHandle(directory_);
+    }
     ActionLock(const ActionLock&) = delete;
     ActionLock& operator=(const ActionLock&) = delete;
 };
@@ -102,26 +118,34 @@ bool confirm() {
 const wchar_t* graphics_name(Graphics mode) {
     if (mode == Graphics::DDrawCompat) return L"DDrawCompat";
     if (mode == Graphics::Original) return L"Original .dll files";
-    return L"Unrecognised .dll files";
+    if (mode == Graphics::Devtest) return L"Steam devtest .dll files";
+    if (mode == Graphics::System) return L"System graphics (no local wrapper)";
+    return L"Other local .dll files";
 }
 
-int launch(const fs::path& root, const fs::path& here) {
-    validate_target(root);
-    auto mode = graphics_state(root);
-    if (mode == Graphics::Unknown) throw std::runtime_error("Unrecognised graphics files");
-    if (mode == Graphics::DDrawCompat) {
-        auto ini = root / L"setup.ini";
-        if (GetPrivateProfileIntW(L"SETTINGS", L"windowmode", -1, ini.c_str()) != 0 ||
-            GetPrivateProfileIntW(L"STARTUP", L"window", -1, ini.c_str()) != 0)
-            throw std::runtime_error("DDrawCompat is installed but fullscreen request settings differ, please restore");
+std::wstring target_text(const wchar_t* text, const Target& target) {
+    std::wstring result(text);
+    for (const auto& pair : {std::pair<std::wstring, std::wstring>{L"%CONFIG%", graphics_config(target).filename().wstring()},
+                             {L"%EXE%", target.executable.filename().wstring()}}) {
+        std::size_t at = 0;
+        while ((at = result.find(pair.first, at)) != std::wstring::npos) {
+            result.replace(at, pair.first.size(), pair.second); at += pair.second.size();
+        }
     }
+    return result;
+}
+
+int launch(const Target& target, const fs::path& here) {
     auto logs = here / L"logs";
     if (!CreateDirectoryW(logs.c_str(), nullptr)) win32_need(GetLastError() == ERROR_ALREADY_EXISTS, "Cannot create logs folder");
     DWORD attributes = GetFileAttributesW(logs.c_str());
     if (!(attributes & FILE_ATTRIBUTE_DIRECTORY) || (attributes & FILE_ATTRIBUTE_REPARSE_POINT))
         throw std::runtime_error("The logs path is not a plain directory");
-    int code = launch_game(root, logs, close_launcher_console);
-    if (code) std::wcerr << L"T3DGM exited with an error. See logs\\last-launch.txt.\n";
+    auto log = logs / (L"last-launch-" + std::to_wstring(GetCurrentProcessId()) + L".txt");
+    int code;
+    try { code = launch_game(target, log, close_launcher_console); }
+    catch (...) { std::wcerr << L"Launch log: " << log.wstring() << L"\n"; throw; }
+    if (code) std::wcerr << L"Application exited with an error. Log: " << log.wstring() << L"\n";
     return code;
 }
 }
@@ -130,28 +154,48 @@ int wmain(int argc, wchar_t** argv) {
     _setmode(_fileno(stdout), _O_U8TEXT);
     _setmode(_fileno(stderr), _O_U8TEXT);
     ConsoleAppearance appearance;
-    bool check = argc == 2 && std::wstring(argv[1]) == L"--check";
+    bool check = false;
     try {
-        if (argc != 1 && !check) throw std::runtime_error("The only command-line option is --check");
+        fs::path selected;
+        for (int at = 1; at < argc; ++at) {
+            std::wstring argument(argv[at]);
+            if (argument == L"--help") {
+                std::wcout << CommandHelp; return 0;
+            }
+            if (argument == L"--check" && !check) check = true;
+            else {
+                need(selected.empty() && !argument.empty() && argument.front() != L'-', "Supply one executable filename, optionally with --check");
+                selected = argument;
+            }
+        }
         SetConsoleTitleW(L"T3DGM Compatibility");
         auto here = module_folder();
-        auto root = game_folder(here);
-        validate_target(root);
+        auto target = identify_target(selected.empty() ? default_executable(here) : selected);
+        auto root = target.folder();
         if (check) {
-            std::wcout << L"Supported executable. Graphics: " << graphics_name(graphics_state(root)) << L".\n";
+            std::wcout << L"Supported native runtime: " << target.profile->name << L".\nExecutable: " << target.executable.wstring()
+                       << L"\nGraphics: " << graphics_name(graphics_state(root)) << L".\n";
+            validate_dependency(target);
+            std::wcout << L"Local d3drm.dll: present (32-bit DLL).\n";
             return 0;
         }
         std::wstring status;
         bool status_error = false;
         for (;;) {
             auto graphics = graphics_state(root);
-            bool restore = graphics == Graphics::DDrawCompat || restore_available(root);
+            bool restore = false, add_config = false;
+            std::wstring backup_error;
+            try { restore = restore_available(root); add_config = restore && !installed_for(target); }
+            catch (const std::exception& error) { backup_error = L"Backup check: " + widen(error.what()) + L"\n"; }
             clear_screen();
-            heading(L"T3DGM Compatibility\n\n");
-            menu_option(L"1. ", L"Launch The 3D Gamemaker (Steam) with temporary-directory pathname patch [" + std::wstring(graphics_name(graphics)) + L"]");
+            heading(L"T3DGM Compatibility 0.2.0\n\n");
+            std::wcout << target.executable.filename().wstring() << L"\n" << root.wstring() << L"\n\n";
+            menu_option(L"1. ", L"Launch " + target.executable.filename().wstring() + L" with temporary-directory pathname patch [" + std::wstring(graphics_name(graphics)) + L"]");
             menu_option(L"2. ", restore ? L"Restore original .dll files" : L"Install DDrawCompat [recommended]");
             menu_option(L"3. ", L"Exit");
+            if (add_config) menu_option(L"4. ", L"Set up DDrawCompat for " + target.executable.filename().wstring());
             std::wcout << L"\n" << Recommendation << L"\n";
+            std::wcout << backup_error;
             if (!status.empty()) {
                 (status_error ? std::wcerr : std::wcout) << status << L"\n\n";
                 status.clear(); status_error = false;
@@ -166,13 +210,14 @@ int wmain(int argc, wchar_t** argv) {
             try {
                 if (option == L"1") {
                     ActionLock lock(root);
-                    return launch(root, here);
-                } else if (option == L"2") {
-                    confirmation_text(restore ? RestoreText : InstallText);
+                    return launch(target, here);
+                } else if (option == L"2" || (option == L"4" && add_config)) {
+                    bool do_restore = option == L"2" && restore;
+                    confirmation_text(target_text(do_restore ? RestoreText : InstallText, target).c_str());
                     if (confirm()) {
                         ActionLock lock(root);
-                        if (restore) restore_originals(root); else install_ddrawcompat(root);
-                        status = restore ? L"Original files restored." : L"DDrawCompat installed.";
+                        if (do_restore) restore_originals(target); else install_ddrawcompat(target);
+                        status = do_restore ? L"Original files restored." : L"DDrawCompat installed.";
                     }
                 }
             } catch (const std::exception& error) {
