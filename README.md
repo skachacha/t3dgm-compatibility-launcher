@@ -67,7 +67,7 @@ Replace `-Toolchain` and `-Output` paths with your own. The script verifies the 
 The executable is written to the output folder. Include the repository's `LICENSES` folder when distributing the executable.
 
 ## AI disclosure
-Codex was used to write the installer and launcher as well as some test cases. All research into DarkBASIC's compatibility problems is performed by me.
+Codex was used to write the installer and launcher as well as some test cases. All research into DarkBASIC's compatibility problems and the specific implementations of the patch for different builds of The 3D Gamemaker and its workfiles is performed by me.
 
 ## License
 This project is licensed under the [MIT License](LICENSE).
