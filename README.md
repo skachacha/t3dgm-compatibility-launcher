@@ -35,7 +35,8 @@ The 3D Gamemaker fails to launch properly on Windows 11 because DarkBASIC attemp
 | Create your own 3D Games (2005) | ✅ | Working |
 | The 3D Gamemaker (Vista Patch) | ✅ | Working |
 | The 3D Gamemaker (TGC "1.1") | ✅ | Working |
-| The 3D Gamemaker (Steam) | ✅ | Working |
+| The 3D Gamemaker (Steam, public) | ✅ | Working |
+| The 3D Gamemaker (Steam, devtest) | ✅ | Working |
 | The 3D Gamemaker (Lite) | ❔ | Untested |
 | The 3D Gamemaker (Lite - Special Edition) | ❔ | Untested |
 | The 3D Gamemaker (German) | ❔ | Untested |
