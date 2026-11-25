@@ -39,7 +39,7 @@ The 3D Gamemaker has two infamous save/load errors:
 - A project with scenes that belong to several genres is sometimes malformed and T3DGM will fail to read it properly: the saved scene pathname can follow the preview scene, while its genre and parameters follow the selected scene. This causes a `GAME FAILED TO LOAD!` error.
 - A project with scenes that contain custom placements will only retain the placements of the current scene. This is an oversight in the save logic of the software.
 
-The launcher fixes these problems.
+The launcher patches an in-memory correction for these faults when `t3dgm.exe` is launched through it, allowing you to save/load projects that contain multiple scenes from multiple genres, multiple scenes with custom placements, or both. It also allows you to load projects that would have previously thrown a `GAME FAILED TO LOAD!` error, but it can't recover lost data for custom placements.
 
 ## Compatibility
 | Release | Status | Notes |
