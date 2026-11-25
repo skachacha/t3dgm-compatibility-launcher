@@ -43,12 +43,6 @@ if($metadata.ProductVersion -ne $version -or $metadata.FileVersion -ne $version)
 [IO.File]::Copy($readme,(Join-Path $folder 'README.md'),$false)
 [IO.File]::Copy($license,(Join-Path $folder 'LICENSE'),$false)
 Copy-Item -LiteralPath $licences -Destination (Join-Path $folder 'LICENSES') -Recurse
-$screenshot=Join-Path $repository 'docs\screenshots\windows11.png'
-if(Test-Path -LiteralPath $screenshot -PathType Leaf) {
-    $images=Join-Path $folder 'docs\screenshots'
-    [IO.Directory]::CreateDirectory($images) | Out-Null
-    [IO.File]::Copy($screenshot,(Join-Path $images 'windows11.png'),$false)
-}
 if(-not $UnpackedOnly) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [IO.Compression.ZipFile]::CreateFromDirectory($folder,$archive,[IO.Compression.CompressionLevel]::Optimal,$true)

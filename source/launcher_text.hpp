@@ -36,7 +36,7 @@ You can reinstall later if you change your mind!
 Continue? [y/N]
 )";
 
-constexpr wchar_t CommandHelp[] = LR"(T3DGM Compatibility Launcher 0.2.0
+constexpr wchar_t CommandHelp[] = LR"(T3DGM Compatibility Launcher 0.3.0
 Usage: T3DGM-Compatibility.exe [--check] [editor.exe|game.exe]
 
 Drag an executable onto the launcher, or specify its filename on the command line.

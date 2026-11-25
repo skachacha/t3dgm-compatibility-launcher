@@ -79,6 +79,62 @@ bool section_name(const IMAGE_SECTION_HEADER& section, const char* name) {
     auto size = std::strlen(name);
     return size <= sizeof padded && (std::memcpy(padded,name,size), std::memcmp(section.Name,padded,8)==0);
 }
+
+std::shared_ptr<EditorProgram> editor_program(const Reader& input, const RuntimeProfile& profile) {
+    bool steam = &profile == &RuntimeProfiles[1];
+    if (&profile != &RuntimeProfiles[0] && !steam) return {};
+    if (input.size < 8) return {};
+    auto start = input.object<std::uint32_t>(input.size-4);
+    if (start > input.size-8) return {};
+    auto at = std::uint64_t(start);
+    std::uint64_t program_at = 0;
+    std::uint32_t program_size = 0;
+    bool ended = false;
+    for (unsigned record = 0; record < 128; ++record) {
+        if (at > input.size-4) return {};
+        auto name_size = input.object<std::uint32_t>(at); at += 4;
+        if (!name_size) {
+            // An appended game container must never receive the editor patch.
+            if (at+4 != input.size || input.object<std::uint32_t>(at) != start) return {};
+            ended = true; break;
+        }
+        if (name_size > 32768 || at+name_size+4 > input.size) return {};
+        std::vector<char> name(name_size);
+        input.read(at,name.data(),name.size()); at += name_size;
+        if (name.back() != '\0') return {};
+        auto size = input.object<std::uint32_t>(at); at += 4;
+        if (size > input.size-at) return {};
+        if (record == 0) {
+            std::string label(name.data());
+            auto slash = label.find_last_of("\\/");
+            if (_stricmp(label.substr(slash == std::string::npos ? 0 : slash+1).c_str(),"_exefile.dat") != 0) return {};
+            program_at = at; program_size = size;
+        }
+        at += size;
+    }
+    if (!ended || program_size < 48 || program_size > 8*1024*1024) return {};
+    const wchar_t* expected = steam ?
+        L"a36cd64c356736c748810136227b6fb5512a8461a6e02ca8a8a2440b6f651977" :
+        L"d1a3e8901a01137367cf1a8a6a4f84c8cd837702bb2ea59b761afe2f7b1b4df0";
+    if (hash_range(input.handle.get(),program_at,program_size) != expected) return {};
+    std::array<std::uint32_t,12> header{};
+    input.read(program_at,header.data(),sizeof header);
+    auto code_at = std::uint64_t(header[7])*4;
+    need(code_at < program_size && (program_size-code_at)%8 == 0,"Unsupported editor program boundary");
+    auto result = std::make_shared<EditorProgram>();
+    result->checkpoint_rva = steam ? 0x36bce : 0x4db64;
+    result->code_pointer_rva = steam ? 0x1af8f0 : 0x210288;
+    result->code_size_rva = steam ? 0x1af8f8 : 0x210290;
+    result->arena_pointer_rva = steam ? 0x186884 : 0x1e721c;
+    result->arena_token_limit = steam ? 31000 : 25000;
+    result->inline_token_base = steam ? 31000 : 25000;
+    result->code_token_base = steam ? 43000 : 37000;
+    result->word_shift = steam ? 90 : 0;
+    result->path_capacity = steam ? 10000 : 2000;
+    result->code.resize(std::size_t((program_size-code_at)/8));
+    input.read(program_at+code_at,result->code.data(),result->code.size()*4);
+    return result;
+}
 }
 
 fs::path default_executable(const fs::path& here) {
@@ -115,7 +171,7 @@ Target identify_target(const fs::path& filename) {
         }
         if (match) {
             // Hold a read-only file lease through process creation and shutdown.
-            return Target{path,&profile,input.handle};
+            return Target{path,&profile,input.handle,editor_program(input,profile)};
         }
     }
     throw std::runtime_error("This executable's native runtime has not been verified");

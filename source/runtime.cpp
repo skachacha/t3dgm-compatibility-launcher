@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 #include "shared.hpp"
+#include "editor_patch.hpp"
 
 
 class Handle {
@@ -298,9 +299,10 @@ DWORD run(const Target& target, const std::string& temporary, Log& log, bool& cl
         }
         startup_handles.clear();
     };
-    bool detached = false, event_pending = false, exited = false, loader_break = false;
+    bool detached = false, event_pending = false, exited = false, loader_break = false, temporary_done = false;
     DEBUG_EVENT event{};
     const auto checkpoint = PreferredBase + target.profile->checkpoint_rva;
+    const auto editor_checkpoint = target.editor ? PreferredBase + target.editor->checkpoint_rva : 0;
     const auto started = GetTickCount64();
     try {
         win32_need(DebugSetProcessKillOnExit(TRUE), "Cannot set startup failure handling");
@@ -324,6 +326,12 @@ DWORD run(const Target& target, const std::string& temporary, Log& log, bool& cl
                 read_remote(process.get(), checkpoint, bytes.data(), bytes.size());
                 need(std::equal(bytes.begin(), bytes.end(), target.profile->signature.begin()), "Startup instruction signature differs");
                 code_byte(process.get(), checkpoint, 0xcc);
+                if (editor_checkpoint) {
+                    std::array<BYTE,3> instruction{};
+                    read_remote(process.get(),editor_checkpoint,instruction.data(),instruction.size());
+                    need(instruction==std::array<BYTE,3>{{0x83,0xc4,0x04}},"Editor startup checkpoint differs");
+                    code_byte(process.get(),editor_checkpoint,0xcc);
+                }
             } else if (event.dwDebugEventCode == CREATE_THREAD_DEBUG_EVENT) {
                 remember(event.u.CreateThread.hThread);
             } else if (event.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT) {
@@ -334,18 +342,33 @@ DWORD run(const Target& target, const std::string& temporary, Log& log, bool& cl
             } else if (event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
                 const auto& exception = event.u.Exception;
                 auto address = reinterpret_cast<std::uintptr_t>(exception.ExceptionRecord.ExceptionAddress);
-                if (exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT && address == checkpoint) {
+                if (exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT &&
+                    (address == checkpoint || (editor_checkpoint && address == editor_checkpoint))) {
                     Handle thread(OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME,
                                              FALSE, event.dwThreadId));
                     win32_need(thread.valid(), "Cannot open startup thread");
                     CONTEXT context{};
-                    context.ContextFlags = CONTEXT_CONTROL;
+                    context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
                     win32_need(GetThreadContext(thread.get(), &context), "Unexpected startup instruction pointer");
-                    need(context.Eip == checkpoint + 1, "Unexpected startup instruction pointer");
-                    redirect(process.get(), target, temporary);
-                    code_byte(process.get(), checkpoint, target.profile->signature[0]);
-                    context.Eip = DWORD(checkpoint);
+                    need(context.Eip == address + 1, "Unexpected startup instruction pointer");
+                    if (address == checkpoint) {
+                        need(!temporary_done,"Temporary checkpoint repeated");
+                        redirect(process.get(), target, temporary);
+                        code_byte(process.get(), checkpoint, target.profile->signature[0]);
+                        temporary_done = true;
+                        log.line(L"Temporary pathname corrected.");
+                    } else {
+                        need(temporary_done && (context.Eax & 0xff) == 1,"Editor program loader did not complete successfully");
+                        log.line(apply_editor_patch(process.get(),*target.editor));
+                        code_byte(process.get(), editor_checkpoint, 0x83);
+                    }
+                    context.Eip = DWORD(address);
                     win32_need(SetThreadContext(thread.get(), &context), "Cannot restore startup instruction pointer");
+                    if (address == checkpoint && target.editor) {
+                        win32_need(ContinueDebugEvent(event.dwProcessId,event.dwThreadId,DBG_CONTINUE),"Cannot continue to editor program checkpoint");
+                        event_pending = false;
+                        continue;
+                    }
                     win32_need(SuspendThread(thread.get()) != DWORD(-1), "Cannot hold startup thread for detachment");
                     win32_need(ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE), "Cannot continue startup event");
                     event_pending = false;
@@ -408,9 +431,11 @@ std::wstring file_hash(const fs::path& path) {
 int launch_game(const Target& target, const fs::path& log_file, void (*on_detached)()) {
     validate_dependency(target);
     Log log(log_file);
-    log.line(L"T3DGM Compatibility 0.2.0");
+    log.line(L"T3DGM Compatibility 0.3.0");
     log.line(L"Executable: " + target.executable.wstring());
     log.line(L"Native runtime: " + std::wstring(target.profile->name));
+    log.line(target.editor ? L"Identified editor program: multilevel save correction enabled." :
+        L"Editor save correction not applied: standalone or unverified editor program.");
     Scratch scratch;
     auto temporary = legacy_path(scratch.path());
     log.line(L"Temporary files on disk: " + scratch.path().wstring());

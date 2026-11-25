@@ -188,9 +188,9 @@ int wmain(int argc, wchar_t** argv) {
             try { restore = restore_available(root); add_config = restore && !installed_for(target); }
             catch (const std::exception& error) { backup_error = L"Backup check: " + widen(error.what()) + L"\n"; }
             clear_screen();
-            heading(L"T3DGM Compatibility 0.2.0\n\n");
+            heading(L"T3DGM Compatibility 0.3.0\n\n");
             std::wcout << target.executable.filename().wstring() << L"\n" << root.wstring() << L"\n\n";
-            menu_option(L"1. ", L"Launch " + target.executable.filename().wstring() + L" with temporary-directory pathname patch [" + std::wstring(graphics_name(graphics)) + L"]");
+            menu_option(L"1. ", L"Launch " + target.executable.filename().wstring() + L" with patches [" + std::wstring(graphics_name(graphics)) + L"]");
             menu_option(L"2. ", restore ? L"Restore original .dll files" : L"Install DDrawCompat [recommended]");
             menu_option(L"3. ", L"Exit");
             if (add_config) menu_option(L"4. ", L"Set up DDrawCompat for " + target.executable.filename().wstring());

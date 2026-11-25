@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <vector>
 
 constexpr wchar_t WrapperSha256[] = L"94895cf6ede8fd0f74ee1447fdc08b7044a9c65a1a25a49a4df893a0370975a3";
 constexpr wchar_t OriginalDDrawSha256[] = L"d977bddd66be64b23c60001d88f779e784e0fb48694147103ac57cf008247282";
@@ -48,9 +49,17 @@ inline constexpr std::array<RuntimeProfile, 3> RuntimeProfiles{{
     }}}
 }};
 
+struct EditorProgram {
+    std::uint32_t checkpoint_rva, code_pointer_rva, code_size_rva, arena_pointer_rva;
+    std::uint32_t arena_token_limit, inline_token_base, code_token_base;
+    std::uint32_t word_shift, path_capacity;
+    std::vector<std::uint32_t> code;
+};
+
 struct Target {
     std::filesystem::path executable;
     const RuntimeProfile* profile = nullptr;
     std::shared_ptr<void> file_lock;
+    std::shared_ptr<EditorProgram> editor;
     std::filesystem::path folder() const { return executable.parent_path(); }
 };

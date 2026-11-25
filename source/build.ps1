@@ -50,7 +50,7 @@ try {
     } finally {Pop-Location}
     $prefixMap='-ffile-prefix-map='+$PSScriptRoot+'=source'
     & $compiler '-std=c++17' '-O2' '-Wall' '-Wextra' '-Werror' '-static' '-municode' `
-        '-Wl,--no-insert-timestamp' $prefixMap 'main.cpp' 'runtime.cpp' 'installation.cpp' 'target.cpp' `
+        '-Wl,--no-insert-timestamp' $prefixMap 'main.cpp' 'runtime.cpp' 'installation.cpp' 'target.cpp' 'editor_patch.cpp' `
         (Join-Path $outputPath 'launcher-res.o') '-ladvapi32' '-lshell32' `
         '-o' (Join-Path $outputPath 'T3DGM-Compatibility.exe')
     if($LASTEXITCODE -ne 0) {throw 'Launcher compilation failed'}
