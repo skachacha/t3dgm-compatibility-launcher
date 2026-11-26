@@ -10,13 +10,14 @@ void write_remote(HANDLE, std::uintptr_t, const void*, SIZE_T);
 namespace {
 struct Ref { unsigned kind; std::uint32_t value; };
 struct Builder {
+    const EditorProgram& program;
     std::uint32_t arena, extension;
     std::vector<std::uint32_t> code, cells;
     std::map<std::string,std::uint32_t> variables, labels, label_ids;
     struct Fix { std::size_t word; Ref ref; };
     std::vector<Fix> fixes;
 
-    Ref a(std::uint32_t slot) const { return {0,arena+slot*4}; }
+    Ref a(std::uint32_t slot) const { return {0,arena+program.slot(slot)*4}; }
     Ref v(const std::string& name, std::uint32_t initial=0) {
         auto found=variables.find(name);
         if (found!=variables.end()) return {1,found->second};
@@ -68,7 +69,7 @@ std::vector<std::uint32_t> relocate_editor_code(const EditorProgram& program,
 
 EditorPatchImage build_editor_patch(const EditorProgram& program,
     std::uint32_t code, std::uint32_t arena, std::uint32_t extension) {
-    Builder b{arena,extension,{},{},{},{},{},{}};
+    Builder b{program,arena,extension,{},{},{},{},{},{}};
     auto selected=b.v("selected"), catalog=b.v("catalog"), genre=b.v("genre"), course=b.v("course");
     auto prefix=b.v("prefix"), epos=b.v("epos"), elements=b.v("elements");
 
@@ -147,7 +148,7 @@ EditorPatchImage build_editor_patch(const EditorProgram& program,
     for (auto word:{77933u,77952u}) {
         auto shifted=word+program.word_shift;
         need(program.code.at(shifted)==671 && program.code.at(shifted+1)==12000 &&
-             program.code.at(shifted+2)==17008 && program.code.at(shifted+3)==19000,"Editor scene load signature differs");
+             program.code.at(shifted+2)==10000+program.slot(7008) && program.code.at(shifted+3)==19000,"Editor scene load signature differs");
         edit(word,{41,result.canonical_entry,2,code+4*(shifted+4)});
     }
     need(program.code.at(78122+program.word_shift)==661,"Editor layout collection signature differs");

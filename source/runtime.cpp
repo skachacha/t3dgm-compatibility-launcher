@@ -431,7 +431,7 @@ std::wstring file_hash(const fs::path& path) {
 int launch_game(const Target& target, const fs::path& log_file, void (*on_detached)()) {
     validate_dependency(target);
     Log log(log_file);
-    log.line(L"T3DGM Compatibility 0.3.0");
+    log.line(L"T3DGM Compatibility 0.4.0");
     log.line(L"Executable: " + target.executable.wstring());
     log.line(L"Native runtime: " + std::wstring(target.profile->name));
     log.line(target.editor ? L"Identified editor program: multilevel save correction enabled." :

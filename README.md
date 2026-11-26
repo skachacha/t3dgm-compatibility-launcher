@@ -44,13 +44,13 @@ The launcher patches an in-memory correction for these faults when `t3dgm.exe` i
 ## Compatibility
 | Release | Status | Notes |
 |:-----------------|:------:|:-------|
-| The 3D Gamemaker (CD-Rom Release, December 2001 Build) | ✅ | Working |
+| The 3D Gamemaker (September 2001 Build) | ✅ | Working |
+| The 3D Gamemaker (CD-Rom Release) | ✅ | Working |
 | Create your own 3D Games (2005) | ✅ | Working |
 | The 3D Gamemaker (Vista Patch) | ✅ | Working |
 | The 3D Gamemaker (TGC "1.1") | ✅ | Working |
 | The 3D Gamemaker (Steam, public) | ✅ | Working |
 | The 3D Gamemaker (Steam, devtest) | ✅ | Working |
-| The 3D Gamemaker (September 2001 Build) | ❌ | Unsupported |
 | The 3D Gamemaker (Lite) | ❔ | Untested |
 | The 3D Gamemaker (Lite - Special Edition) | ❔ | Untested |
 | The 3D Gamemaker (German) | ❔ | Untested |
